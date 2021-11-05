@@ -188,6 +188,25 @@ ID3D12RootSignature* gRootSignature = nullptr;
 std::map<std::string, ID3DBlob*> gShaders;
 std::map<std::string, ID3D12PipelineState*> gPSOs;
 
+struct RenderItem
+{
+	RenderItem() = default;
+
+	XMFLOAT4X4 World = Identity4x4();
+	XMFLOAT4X4 TexTransform = Identity4x4();
+
+	// Index into GPU constant buffer corresponding to the ObjectCB for this render item.
+	UINT ObjCBIndex = -1;
+
+	MeshData* MeshData;
+
+	// Primitive topology.
+	D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+	// DrawIndexedInstanced parameters.
+	UINT IndexCount = 0;
+};
+
 struct Material
 {
 	std::string Name;
@@ -225,7 +244,7 @@ public:
 std::map<std::string, MeshData> gMeshDatas;
 std::map<std::wstring, Microsoft::WRL::ComPtr<ID3D12Resource>> gTexDatas;
 
-std::map<std::string, Material> gMaterials;
+std::map<std::string, std::unique_ptr<Material>> gMaterials;
 
 void InitMaterials();
 
@@ -1351,38 +1370,30 @@ void CreateTextureResourceFromFile(std::wstring fileName)
 
 void InitMaterials()
 {
-	auto grass = Material();
-	grass.Name = "grass";
-	grass.DiffuseSrvHeapIndex = 1;
-	grass.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-	grass.FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
-	grass.Roughness = 0.125f;
+	auto grass = std::make_unique<Material>();
+	grass->Name = "grass";
+	grass->DiffuseSrvHeapIndex = 0;
+	grass->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	grass->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	grass->Roughness = 0.125f;
 
-	auto wall = Material();
-	wall.Name = "wall";
-	wall.DiffuseSrvHeapIndex = 2;
-	wall.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-	wall.FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
-	wall.Roughness = 0.125f;
+	auto wall = std::make_unique<Material>();
+	wall->Name = "wall";
+	wall->DiffuseSrvHeapIndex = 1;
+	wall->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	wall->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	wall->Roughness = 0.125f;
 
 	// This is not a good water material definition, but we do not have all the rendering
 	// tools we need (transparency, environment reflection), so we fake it for now.
-	auto water = Material();
-	water.Name = "water";
-	water.DiffuseSrvHeapIndex = 3;
-	water.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
-	water.FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
-	water.Roughness = 0.0f;
+	auto water = std::make_unique<Material>();
+	water->Name = "water";
+	water->DiffuseSrvHeapIndex = 2;
+	water->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
+	water->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
+	water->Roughness = 0.0f;
 
-	auto wirefence = Material();
-	wirefence.Name = "wirefence";
-	wirefence.DiffuseSrvHeapIndex = 4;
-	wirefence.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-	wirefence.FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
-	wirefence.Roughness = 0.25f;
-
-	gMaterials["grass"] = grass;
-	gMaterials["wall"] = wall;
-	gMaterials["water"] = water;
-	gMaterials["wirefence"] = wirefence;
+	gMaterials["grass"] = std::move(grass);
+	gMaterials["wall"] = std::move(wall);
+	gMaterials["water"] = std::move(water);
 }
