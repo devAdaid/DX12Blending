@@ -191,9 +191,8 @@ std::map<std::string, ID3D12PipelineState*> gPSOs;
 struct Material
 {
 	std::string Name;
+	std::string TextureFileName;
 	int MatCBIndex = -1;
-	int DiffuseSrvHeapIndex = -1; // diffuse tex
-	int NormalSrvHeapIndex = -1; // normal tex
 
 	DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
 	DirectX::XMFLOAT3 FresnelR0 = { 0.01f, 0.01f, 0.01f };
@@ -221,6 +220,7 @@ public:
 
 std::map<std::string, MeshData> gMeshDatas;
 std::map<std::wstring, Microsoft::WRL::ComPtr<ID3D12Resource>> gTexDatas;
+std::map<std::string, int> gTexDataOffsets;
 
 std::map<std::string, std::unique_ptr<Material>> gMaterials;
 
@@ -946,21 +946,28 @@ void InitShaderResources()
 {
 	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(gSrvHeap->GetCPUDescriptorHandleForHeapStart());
 
+	int offset = 0;
 	// TODO: 텍스쳐 순서 보장하기?
-	for each (auto var in gTexDatas)
+	for each (auto texPair in gTexDatas)
 	{
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = { };
-		srvDesc.Format = var.second->GetDesc().Format;
+		srvDesc.Format = texPair.second->GetDesc().Format;
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MostDetailedMip = 0;
-		srvDesc.Texture2D.MipLevels = var.second->GetDesc().MipLevels;
+		srvDesc.Texture2D.MipLevels = texPair.second->GetDesc().MipLevels;
 		srvDesc.Texture2D.PlaneSlice = 0;
 		srvDesc.Texture2D.ResourceMinLODClamp = 0;
 
-		gDevice->CreateShaderResourceView(var.second.Get(), &srvDesc, srvHandle);
+		gDevice->CreateShaderResourceView(texPair.second.Get(), &srvDesc, srvHandle);
+
+		std::string texStr;
+		texStr.assign(texPair.first.begin(), texPair.first.end());
+		gTexDataOffsets.insert(std::make_pair(texStr, offset));
 
 		srvHandle.Offset(1, gCbvHeapSize);
+
+		offset += 1;
 	}
 }
 
@@ -986,14 +993,14 @@ void CreateMaterials()
 {
 	auto grass = std::make_unique<Material>();
 	grass->Name = "grass";
-	grass->DiffuseSrvHeapIndex = 0;
+	grass->TextureFileName = "grass.dds";
 	grass->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 	grass->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
 	grass->Roughness = 0.125f;
 
 	auto box = std::make_unique<Material>();
 	box->Name = "box";
-	box->DiffuseSrvHeapIndex = 1;
+	box->TextureFileName = "WireFence.dds";
 	box->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 	box->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
 	box->Roughness = 0.125f;
@@ -1002,7 +1009,7 @@ void CreateMaterials()
 	// tools we need (transparency, environment reflection), so we fake it for now.
 	auto water = std::make_unique<Material>();
 	water->Name = "water";
-	water->DiffuseSrvHeapIndex = 2;
+	water->TextureFileName = "water.dds";
 	water->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
 	water->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
 	water->Roughness = 0.0f;
@@ -1313,13 +1320,13 @@ void CreateRenderItems()
 	grassItem->World = Identity4x4();
 	grassItem->MeshData = &gMeshDatas["grass"];
 	grassItem->Material = gMaterials["grass"].get();
-	gTransparentRenderItems.push_back(*grassItem);
+	gOpaqueRenderItems.push_back(*grassItem);
 
 	auto boxItem = std::make_unique<RenderItem>();
 	boxItem->World = Identity4x4();
 	boxItem->MeshData = &gMeshDatas["box"];
 	boxItem->Material = gMaterials["box"].get();
-	gTransparentRenderItems.push_back(*boxItem);
+	gAlphaTestedRenderItems.push_back(*boxItem);
 }
 
 void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem>& renderItems)
@@ -1342,7 +1349,8 @@ void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<Rende
 
 			CD3DX12_GPU_DESCRIPTOR_HANDLE tex(gSrvHeap->GetGPUDescriptorHandleForHeapStart());
 			//tex.Offset(4, gCbvHeapSize);
-			tex.Offset(ri->Material->DiffuseSrvHeapIndex, gCbvHeapSize);
+			auto texOffset = gTexDataOffsets[ri->Material->TextureFileName];
+			tex.Offset(texOffset, gCbvHeapSize);
 			gCommandList->SetGraphicsRootDescriptorTable(1, tex);
 		}
 

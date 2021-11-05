@@ -24,6 +24,14 @@ cbuffer ObjectConstantBuffer : register(b0)
     float gFogRange;
 };
 
+cbuffer cbMaterial : register(b1)
+{
+    float4   gDiffuseAlbedo;
+    float3   gFresnelR0;
+    float    gRoughness;
+    float4x4 gMatTransform;
+};
+
 struct PSInput
 {
     float3 posW : POSITION;
@@ -62,14 +70,14 @@ float4 PSMain(PSInput input) : SV_TARGET
     const float4 ambientLight = float4(0.0f, 0.0f, 0.0f, 1.0f);
 //const float4 diffuseAlbedo = float4(1.0f, 1.0f, 1.0f, 1.0f);
 //const float4 diffuseAlbedo = gScribbleTex.Sample(gSampler, input.tex + texOffset);
-const float4 diffuseAlbedo = gScribbleTex.Sample(gSampler, input.tex);
+    const float4 diffuseAlbedo = gScribbleTex.Sample(gSampler, input.tex) * gDiffuseAlbedo;
 
 #ifdef ALPHA_TEST
     clip(diffuseAlbedo.a - 0.1f);
 #endif
 
-    const float3 fresnelR0 = float3(0.04f, 0.04f, 0.04f);
-    const float shininess = 0.5f;
+    const float3 fresnelR0 = gFresnelR0;
+    const float shininess = 1.0f - gRoughness;
 
     const float lightStrength = 0.3f;
     //const float3 lightDirection = float3(1.5f, -1.0f, 1.5f);
