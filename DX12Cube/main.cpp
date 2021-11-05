@@ -188,25 +188,6 @@ ID3D12RootSignature* gRootSignature = nullptr;
 std::map<std::string, ID3DBlob*> gShaders;
 std::map<std::string, ID3D12PipelineState*> gPSOs;
 
-struct RenderItem
-{
-	RenderItem() = default;
-
-	XMFLOAT4X4 World = Identity4x4();
-	XMFLOAT4X4 TexTransform = Identity4x4();
-
-	// Index into GPU constant buffer corresponding to the ObjectCB for this render item.
-	UINT ObjCBIndex = -1;
-
-	MeshData* MeshData;
-
-	// Primitive topology.
-	D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-
-	// DrawIndexedInstanced parameters.
-	UINT IndexCount = 0;
-};
-
 struct Material
 {
 	std::string Name;
@@ -231,13 +212,10 @@ public:
 	D3D12_INDEX_BUFFER_VIEW indexBufferView = { };
 	UINT indexCount;
 
-	Material* mat = nullptr;
-
 	void Release()
 	{
 		vertexBuffer->Release();
 		indexBuffer->Release();
-		mat = nullptr;
 	}
 };
 
@@ -246,24 +224,36 @@ std::map<std::wstring, Microsoft::WRL::ComPtr<ID3D12Resource>> gTexDatas;
 
 std::map<std::string, std::unique_ptr<Material>> gMaterials;
 
-void InitMaterials();
+// RenderItem
+struct RenderItem
+{
+	RenderItem() = default;
+
+	XMFLOAT4X4 World = Identity4x4();
+	XMFLOAT4X4 TexTransform = Identity4x4();
+
+	// Index into GPU constant buffer corresponding to the ObjectCB for this render item.
+	//UINT ObjCBIndex = -1;
+
+	MeshData* MeshData;
+	Material* Material = nullptr;
+};
+
+std::vector<RenderItem> gOpaqueRenderItems;
+std::vector<RenderItem> gTransparentRenderItems;
+std::vector<RenderItem> gAlphaTestedRenderItems;
 
 // 초기화
 void CreateRootSignature();
 void CreatePSO();
 
 // 메쉬 초기화 및 버퍼 생성, 그리기
-void InitBox();
-void RenderBox();
-
-void InitGrass();
-void RenderGrass();
-
-void InitWater();
-void RenderWater();
-
-void InitWall();
-void RenderWall();
+void CreateMaterials();
+void CreateBoxGeometry();
+void CreateWaterGeometry();
+void CreateGrassGeometry();
+void CreateRenderItems();
+void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem>& renderItems);
 
 // 상수 버퍼
 void InitConstantBuffer();
@@ -462,11 +452,11 @@ HRESULT InitD3D(HWND hWnd)
 	CreateTextureResourceFromFile(L"water.dds");
 	CreateTextureResourceFromFile(L"WireFence.dds");
 
-	InitMaterials();
-
-	InitBox();
-	InitGrass();
-	InitWater();
+	CreateMaterials();
+	CreateBoxGeometry();
+	CreateGrassGeometry();
+	CreateWaterGeometry();
+	CreateRenderItems();
 
 	InitConstantBuffer();
 
@@ -692,15 +682,13 @@ void PopulateCommandList()
 	// 각종 물체 그리기 및 PSO 변경
 	//gCommandList->SetPipelineState(gPSOs["opaque"]); // 이미 위에서 지정함.
 
-	RenderGrass();
+	DrawRenderItems(gCommandList, gOpaqueRenderItems);
 
 	gCommandList->SetPipelineState(gPSOs["alphaTested"]);
-
-	RenderBox();
+	DrawRenderItems(gCommandList, gAlphaTestedRenderItems);
 
 	gCommandList->SetPipelineState(gPSOs["transparent"]);
-
-	//RenderWater();
+	DrawRenderItems(gCommandList, gTransparentRenderItems);
 
 	gCommandList->ResourceBarrier(1,
 		&CD3DX12_RESOURCE_BARRIER::Transition(
@@ -930,7 +918,101 @@ void CreatePSO()
 	ThrowIfFailed(gDevice->CreateGraphicsPipelineState(&alphaTestedPSODesc, IID_PPV_ARGS(&gPSOs["alphaTested"])));
 }
 
-void InitBox()
+void InitConstantBuffer()
+{
+	static_assert(sizeof(ObjectConstantBuffer) % 256 == 0, "constant buffer must be 256 byte");
+	const UINT constantBufferSize = sizeof(ObjectConstantBuffer);
+
+	ThrowIfFailed(gDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&gConstantBuffer)
+	));
+
+	D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = { };
+	cbvDesc.BufferLocation = gConstantBuffer->GetGPUVirtualAddress();
+	cbvDesc.SizeInBytes = constantBufferSize;
+	gDevice->CreateConstantBufferView(&cbvDesc, gCbvHeap->GetCPUDescriptorHandleForHeapStart());
+
+	gConstantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&gCbvDataBegin));
+	memcpy(gCbvDataBegin, &gConstantBufferData, sizeof(gConstantBufferData));
+	//gConstantBuffer->Unmap(0, nullptr);
+}
+
+void InitShaderResources()
+{
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(gSrvHeap->GetCPUDescriptorHandleForHeapStart());
+
+	// TODO: 텍스쳐 순서 보장하기?
+	for each (auto var in gTexDatas)
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = { };
+		srvDesc.Format = var.second->GetDesc().Format;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MostDetailedMip = 0;
+		srvDesc.Texture2D.MipLevels = var.second->GetDesc().MipLevels;
+		srvDesc.Texture2D.PlaneSlice = 0;
+		srvDesc.Texture2D.ResourceMinLODClamp = 0;
+
+		gDevice->CreateShaderResourceView(var.second.Get(), &srvDesc, srvHandle);
+
+		srvHandle.Offset(1, gCbvHeapSize);
+	}
+}
+
+void CreateTextureResourceFromFile(std::wstring fileName)
+{
+	ThrowIfFailed(gCommandAlloc->Reset());
+	//ThrowIfFailed(gCommandList->Reset(gCommandAlloc, gPSO));
+	ThrowIfFailed(gCommandList->Reset(gCommandAlloc, nullptr));
+
+	Microsoft::WRL::ComPtr<ID3D12Resource> uploadHeap;
+	gTexDatas[fileName] = nullptr;
+	CreateDDSTextureFromFile12(gDevice, gCommandList, fileName.data(), gTexDatas[fileName], uploadHeap);
+
+	// 무조건 닫아준다.
+	ThrowIfFailed(gCommandList->Close());
+
+	ID3D12CommandList* cmdLists[] = { gCommandList };
+	gCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
+	FlushCommandQueue();
+}
+
+void CreateMaterials()
+{
+	auto grass = std::make_unique<Material>();
+	grass->Name = "grass";
+	grass->DiffuseSrvHeapIndex = 0;
+	grass->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	grass->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	grass->Roughness = 0.125f;
+
+	auto box = std::make_unique<Material>();
+	box->Name = "box";
+	box->DiffuseSrvHeapIndex = 1;
+	box->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	box->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
+	box->Roughness = 0.125f;
+
+	// This is not a good water material definition, but we do not have all the rendering
+	// tools we need (transparency, environment reflection), so we fake it for now.
+	auto water = std::make_unique<Material>();
+	water->Name = "water";
+	water->DiffuseSrvHeapIndex = 2;
+	water->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
+	water->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
+	water->Roughness = 0.0f;
+
+	gMaterials["grass"] = std::move(grass);
+	gMaterials["box"] = std::move(box);
+	gMaterials["water"] = std::move(water);
+}
+
+void CreateBoxGeometry()
 {
 	Vertex vertices[] =
 	{
@@ -1000,114 +1082,6 @@ void InitBox()
 
 	const UINT vertexBufferSize = sizeof(vertices);
 	const UINT indexBufferSize = sizeof(indices);
-	UINT gIndexCount = _countof(indices);
-
-	ID3D12Resource* gVertexBuffer;
-
-	// 버텍스 버퍼 생성
-	ThrowIfFailed(gDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(vertexBufferSize),
-		D3D12_RESOURCE_STATE_GENERIC_READ,
-		nullptr,
-		IID_PPV_ARGS(&gVertexBuffer)
-	));
-
-	// 버텍스 버퍼에 삼각형 정보 복사
-	UINT8* pVertexDataBegin;
-	CD3DX12_RANGE readRange(0, 0);
-	ThrowIfFailed(gVertexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&pVertexDataBegin)));
-	memcpy(pVertexDataBegin, vertices, sizeof(vertices));
-	gVertexBuffer->Unmap(0, nullptr);
-
-	D3D12_VERTEX_BUFFER_VIEW gVertexBufferView;
-
-	// 버텍스 버퍼 뷰 생성
-	gVertexBufferView.BufferLocation = gVertexBuffer->GetGPUVirtualAddress();
-	gVertexBufferView.SizeInBytes = vertexBufferSize;
-	gVertexBufferView.StrideInBytes = sizeof(Vertex);
-
-	ID3D12Resource* gIndexBuffer;
-	// 인덱스 버퍼 생성
-	ThrowIfFailed(gDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(indexBufferSize),
-		D3D12_RESOURCE_STATE_GENERIC_READ,
-		nullptr,
-		IID_PPV_ARGS(&gIndexBuffer)
-	));
-
-	// 인덱스 버퍼에 삼각형 정보 복사
-	UINT8* pIndexDataBegin;
-	ThrowIfFailed(gIndexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&pIndexDataBegin)));
-	memcpy(pIndexDataBegin, indices, sizeof(indices));
-	gIndexBuffer->Unmap(0, nullptr);
-
-	D3D12_INDEX_BUFFER_VIEW gIndexBufferView;
-
-	// 인덱스 버퍼 뷰 생성
-	gIndexBufferView.BufferLocation = gIndexBuffer->GetGPUVirtualAddress();
-	gIndexBufferView.SizeInBytes = indexBufferSize;
-	gIndexBufferView.Format = DXGI_FORMAT_R16_UINT;
-
-	gMeshDatas["box"].vertexBuffer = gVertexBuffer;
-	gMeshDatas["box"].vertexBufferView = gVertexBufferView;
-	gMeshDatas["box"].indexBuffer = gIndexBuffer;
-	gMeshDatas["box"].indexBufferView = gIndexBufferView;
-	gMeshDatas["box"].indexCount = gIndexCount;
-	gMeshDatas["box"].mat = &gMaterials["wirefence"];
-
-	FlushCommandQueue();
-}
-
-void RenderBox()
-{
-	// 첫 번째 루트 파라미터
-	{
-		ID3D12DescriptorHeap* heaps[] = { gCbvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-		gCommandList->SetGraphicsRootDescriptorTable(0, gCbvHeap->GetGPUDescriptorHandleForHeapStart());
-	}
-
-	// 두 번째 루트 파라미터
-	{
-		ID3D12DescriptorHeap* heaps[] = { gSrvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-
-		CD3DX12_GPU_DESCRIPTOR_HANDLE tex(gSrvHeap->GetGPUDescriptorHandleForHeapStart());
-		//tex.Offset(4, gCbvHeapSize);
-		tex.Offset(gMeshDatas["box"].mat->DiffuseSrvHeapIndex, gCbvHeapSize);
-		gCommandList->SetGraphicsRootDescriptorTable(1, tex);
-	}
-
-	gCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	gCommandList->IASetVertexBuffers(0, 1, &gMeshDatas["box"].vertexBufferView);
-	gCommandList->IASetIndexBuffer(&gMeshDatas["box"].indexBufferView);
-	gCommandList->DrawIndexedInstanced(gMeshDatas["box"].indexCount, 1, 0, 0, 0);
-}
-
-void InitGrass()
-{
-	Vertex vertices[] =
-	{
-		// top face
-		{{-100.0f, -10.0f, -100.0f}, {0.0f, 1.0f, 0.0f}, {0, 1}},
-		{{-100.0f, -10.0f, +100.0f}, {0.0f, 1.0f, 0.0f}, {0, 0}},
-		{{+100.0f, -10.0f, +100.0f}, {0.0f, 1.0f, 0.0f}, {1, 0}},
-		{{+100.0f, -10.0f, -100.0f}, {0.0f, 1.0f, 0.0f}, {1, 1}},
-	};
-
-	UINT16 indices[] =
-	{
-		// front face
-		0, 1, 2,
-		0, 2, 3,
-	};
-
-	const UINT vertexBufferSize = sizeof(vertices);
-	const UINT indexBufferSize = sizeof(indices);
 	UINT indexCount = _countof(indices);
 
 	ID3D12Resource* vertexBuffer;
@@ -1160,43 +1134,16 @@ void InitGrass()
 	indexBufferView.SizeInBytes = indexBufferSize;
 	indexBufferView.Format = DXGI_FORMAT_R16_UINT;
 
-	gMeshDatas["grass"].vertexBuffer = vertexBuffer;
-	gMeshDatas["grass"].vertexBufferView = vertexBufferView;
-	gMeshDatas["grass"].indexBuffer = indexBuffer;
-	gMeshDatas["grass"].indexBufferView = indexBufferView;
-	gMeshDatas["grass"].indexCount = indexCount;
-	gMeshDatas["grass"].mat = &gMaterials["grass"];
+	gMeshDatas["box"].vertexBuffer = vertexBuffer;
+	gMeshDatas["box"].vertexBufferView = vertexBufferView;
+	gMeshDatas["box"].indexBuffer = indexBuffer;
+	gMeshDatas["box"].indexBufferView = indexBufferView;
+	gMeshDatas["box"].indexCount = indexCount;
 
 	FlushCommandQueue();
 }
 
-void RenderGrass()
-{
-	// 첫 번째 루트 파라미터
-	{
-		ID3D12DescriptorHeap* heaps[] = { gCbvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-		gCommandList->SetGraphicsRootDescriptorTable(0, gCbvHeap->GetGPUDescriptorHandleForHeapStart());
-	}
-
-	// 두 번째 루트 파라미터
-	{
-		ID3D12DescriptorHeap* heaps[] = { gSrvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-
-		CD3DX12_GPU_DESCRIPTOR_HANDLE tex(gSrvHeap->GetGPUDescriptorHandleForHeapStart());
-		//tex.Offset(4, gCbvHeapSize);
-		tex.Offset(gMeshDatas["grass"].mat->DiffuseSrvHeapIndex, gCbvHeapSize);
-		gCommandList->SetGraphicsRootDescriptorTable(1, tex);
-	}
-
-	gCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	gCommandList->IASetVertexBuffers(0, 1, &gMeshDatas["grass"].vertexBufferView);
-	gCommandList->IASetIndexBuffer(&gMeshDatas["grass"].indexBufferView);
-	gCommandList->DrawIndexedInstanced(gMeshDatas["grass"].indexCount, 1, 0, 0, 0);
-}
-
-void InitWater()
+void CreateWaterGeometry()
 {
 	Vertex vertices[] =
 	{
@@ -1273,127 +1220,135 @@ void InitWater()
 	gMeshDatas["water"].indexBuffer = indexBuffer;
 	gMeshDatas["water"].indexBufferView = indexBufferView;
 	gMeshDatas["water"].indexCount = indexCount;
-	gMeshDatas["water"].mat = &gMaterials["water"];
-
-	FlushCommandQueue();
 }
 
-void RenderWater()
+void CreateGrassGeometry()
 {
-	// 첫 번째 루트 파라미터
+	Vertex vertices[] =
 	{
-		ID3D12DescriptorHeap* heaps[] = { gCbvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-		gCommandList->SetGraphicsRootDescriptorTable(0, gCbvHeap->GetGPUDescriptorHandleForHeapStart());
-	}
+		// top face
+		{{-100.0f, -10.0f, -100.0f}, {0.0f, 1.0f, 0.0f}, {0, 1}},
+		{{-100.0f, -10.0f, +100.0f}, {0.0f, 1.0f, 0.0f}, {0, 0}},
+		{{+100.0f, -10.0f, +100.0f}, {0.0f, 1.0f, 0.0f}, {1, 0}},
+		{{+100.0f, -10.0f, -100.0f}, {0.0f, 1.0f, 0.0f}, {1, 1}},
+	};
 
-	// 두 번째 루트 파라미터
+	UINT16 indices[] =
 	{
-		ID3D12DescriptorHeap* heaps[] = { gSrvHeap };
-		gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+		// front face
+		0, 1, 2,
+		0, 2, 3,
+	};
 
-		CD3DX12_GPU_DESCRIPTOR_HANDLE tex(gSrvHeap->GetGPUDescriptorHandleForHeapStart());
-		//tex.Offset(4, gCbvHeapSize);
-		tex.Offset(gMeshDatas["water"].mat->DiffuseSrvHeapIndex, gCbvHeapSize);
-		gCommandList->SetGraphicsRootDescriptorTable(1, tex);
-	}
+	const UINT vertexBufferSize = sizeof(vertices);
+	const UINT indexBufferSize = sizeof(indices);
+	UINT indexCount = _countof(indices);
 
-	gCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	gCommandList->IASetVertexBuffers(0, 1, &gMeshDatas["water"].vertexBufferView);
-	gCommandList->IASetIndexBuffer(&gMeshDatas["water"].indexBufferView);
-	gCommandList->DrawIndexedInstanced(gMeshDatas["water"].indexCount, 1, 0, 0, 0);
-}
+	ID3D12Resource* vertexBuffer;
 
-void InitConstantBuffer()
-{
-	static_assert(sizeof(ObjectConstantBuffer) % 256 == 0, "constant buffer must be 256 byte");
-	const UINT constantBufferSize = sizeof(ObjectConstantBuffer);
-
+	// 버텍스 버퍼 생성
 	ThrowIfFailed(gDevice->CreateCommittedResource(
 		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
 		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(constantBufferSize),
+		&CD3DX12_RESOURCE_DESC::Buffer(vertexBufferSize),
 		D3D12_RESOURCE_STATE_GENERIC_READ,
 		nullptr,
-		IID_PPV_ARGS(&gConstantBuffer)
+		IID_PPV_ARGS(&vertexBuffer)
 	));
 
-	D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = { };
-	cbvDesc.BufferLocation = gConstantBuffer->GetGPUVirtualAddress();
-	cbvDesc.SizeInBytes = constantBufferSize;
-	gDevice->CreateConstantBufferView(&cbvDesc, gCbvHeap->GetCPUDescriptorHandleForHeapStart());
+	// 버텍스 버퍼에 삼각형 정보 복사
+	UINT8* pVertexDataBegin;
+	CD3DX12_RANGE readRange(0, 0);
+	ThrowIfFailed(vertexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&pVertexDataBegin)));
+	memcpy(pVertexDataBegin, vertices, sizeof(vertices));
+	vertexBuffer->Unmap(0, nullptr);
 
-	gConstantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&gCbvDataBegin));
-	memcpy(gCbvDataBegin, &gConstantBufferData, sizeof(gConstantBufferData));
-	//gConstantBuffer->Unmap(0, nullptr);
+	D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+
+	// 버텍스 버퍼 뷰 생성
+	vertexBufferView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
+	vertexBufferView.SizeInBytes = vertexBufferSize;
+	vertexBufferView.StrideInBytes = sizeof(Vertex);
+
+	ID3D12Resource* indexBuffer;
+	// 인덱스 버퍼 생성
+	ThrowIfFailed(gDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(indexBufferSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&indexBuffer)
+	));
+
+	// 인덱스 버퍼에 삼각형 정보 복사
+	UINT8* pIndexDataBegin;
+	ThrowIfFailed(indexBuffer->Map(0, nullptr, reinterpret_cast<void**>(&pIndexDataBegin)));
+	memcpy(pIndexDataBegin, indices, sizeof(indices));
+	indexBuffer->Unmap(0, nullptr);
+
+	D3D12_INDEX_BUFFER_VIEW indexBufferView;
+
+	// 인덱스 버퍼 뷰 생성
+	indexBufferView.BufferLocation = indexBuffer->GetGPUVirtualAddress();
+	indexBufferView.SizeInBytes = indexBufferSize;
+	indexBufferView.Format = DXGI_FORMAT_R16_UINT;
+
+	gMeshDatas["grass"].vertexBuffer = vertexBuffer;
+	gMeshDatas["grass"].vertexBufferView = vertexBufferView;
+	gMeshDatas["grass"].indexBuffer = indexBuffer;
+	gMeshDatas["grass"].indexBufferView = indexBufferView;
+	gMeshDatas["grass"].indexCount = indexCount;
 }
 
-void InitShaderResources()
+void CreateRenderItems()
 {
-	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(gSrvHeap->GetCPUDescriptorHandleForHeapStart());
+	auto waterItem = std::make_unique<RenderItem>();
+	waterItem->World = Identity4x4();
+	waterItem->MeshData = &gMeshDatas["water"];
+	waterItem->Material = gMaterials["water"].get();
+	gTransparentRenderItems.push_back(*waterItem);
 
-	// TODO: 텍스쳐 순서 보장하기?
-	for each (auto var in gTexDatas)
+	auto grassItem = std::make_unique<RenderItem>();
+	grassItem->World = Identity4x4();
+	grassItem->MeshData = &gMeshDatas["grass"];
+	grassItem->Material = gMaterials["grass"].get();
+	gTransparentRenderItems.push_back(*grassItem);
+
+	auto boxItem = std::make_unique<RenderItem>();
+	boxItem->World = Identity4x4();
+	boxItem->MeshData = &gMeshDatas["box"];
+	boxItem->Material = gMaterials["box"].get();
+	gTransparentRenderItems.push_back(*boxItem);
+}
+
+void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem>& renderItems)
+{
+	for (auto i = 0; i < renderItems.size(); ++i)
 	{
-		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = { };
-		srvDesc.Format = var.second->GetDesc().Format;
-		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		srvDesc.Texture2D.MostDetailedMip = 0;
-		srvDesc.Texture2D.MipLevels = var.second->GetDesc().MipLevels;
-		srvDesc.Texture2D.PlaneSlice = 0;
-		srvDesc.Texture2D.ResourceMinLODClamp = 0;
+		auto ri = &renderItems[i];
 
-		gDevice->CreateShaderResourceView(var.second.Get(), &srvDesc, srvHandle);
+		// 첫 번째 루트 파라미터
+		{
+			ID3D12DescriptorHeap* heaps[] = { gCbvHeap };
+			gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+			gCommandList->SetGraphicsRootDescriptorTable(0, gCbvHeap->GetGPUDescriptorHandleForHeapStart());
+		}
 
-		srvHandle.Offset(1, gCbvHeapSize);
+		// 두 번째 루트 파라미터
+		{
+			ID3D12DescriptorHeap* heaps[] = { gSrvHeap };
+			gCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+			CD3DX12_GPU_DESCRIPTOR_HANDLE tex(gSrvHeap->GetGPUDescriptorHandleForHeapStart());
+			//tex.Offset(4, gCbvHeapSize);
+			tex.Offset(ri->Material->DiffuseSrvHeapIndex, gCbvHeapSize);
+			gCommandList->SetGraphicsRootDescriptorTable(1, tex);
+		}
+
+		cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		cmdList->IASetVertexBuffers(0, 1, &ri->MeshData->vertexBufferView);
+		cmdList->IASetIndexBuffer(&ri->MeshData->indexBufferView);
+		cmdList->DrawIndexedInstanced(ri->MeshData->indexCount, 1, 0, 0, 0);
 	}
-}
-
-void CreateTextureResourceFromFile(std::wstring fileName)
-{
-	ThrowIfFailed(gCommandAlloc->Reset());
-	//ThrowIfFailed(gCommandList->Reset(gCommandAlloc, gPSO));
-	ThrowIfFailed(gCommandList->Reset(gCommandAlloc, nullptr));
-
-	Microsoft::WRL::ComPtr<ID3D12Resource> uploadHeap;
-	gTexDatas[fileName] = nullptr;
-	CreateDDSTextureFromFile12(gDevice, gCommandList, fileName.data(), gTexDatas[fileName], uploadHeap);
-
-	// 무조건 닫아준다.
-	ThrowIfFailed(gCommandList->Close());
-
-	ID3D12CommandList* cmdLists[] = { gCommandList };
-	gCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
-	FlushCommandQueue();
-}
-
-void InitMaterials()
-{
-	auto grass = std::make_unique<Material>();
-	grass->Name = "grass";
-	grass->DiffuseSrvHeapIndex = 0;
-	grass->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-	grass->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
-	grass->Roughness = 0.125f;
-
-	auto wall = std::make_unique<Material>();
-	wall->Name = "wall";
-	wall->DiffuseSrvHeapIndex = 1;
-	wall->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-	wall->FresnelR0 = XMFLOAT3(0.01f, 0.01f, 0.01f);
-	wall->Roughness = 0.125f;
-
-	// This is not a good water material definition, but we do not have all the rendering
-	// tools we need (transparency, environment reflection), so we fake it for now.
-	auto water = std::make_unique<Material>();
-	water->Name = "water";
-	water->DiffuseSrvHeapIndex = 2;
-	water->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.5f);
-	water->FresnelR0 = XMFLOAT3(0.1f, 0.1f, 0.1f);
-	water->Roughness = 0.0f;
-
-	gMaterials["grass"] = std::move(grass);
-	gMaterials["wall"] = std::move(wall);
-	gMaterials["water"] = std::move(water);
 }
